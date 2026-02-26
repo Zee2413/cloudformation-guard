@@ -38,9 +38,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate semver
+      - name: Validate branch and semver
         id: version
         run: |
+          if [[ "${{ github.ref_name }}" != "main" ]]; then
+            echo "::error::Releases must be triggered from the main branch, got '${{ github.ref_name }}'"
+            exit 1
+          fi
           VERSION="${{ inputs.version }}"
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
             echo "::error::Invalid semver: $VERSION"
