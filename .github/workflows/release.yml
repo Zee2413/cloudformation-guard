@@ -1,181 +1,333 @@
 name: Release
+
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 3.2.0)"
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run (skip publishing)"
+        required: false
+        type: boolean
+        default: false
+      skip_crates:
+        description: "Skip crates.io publish"
+        required: false
+        type: boolean
+        default: false
+      skip_homebrew:
+        description: "Skip Homebrew PR"
+        required: false
+        type: boolean
+        default: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Validate input & run tests
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate & Test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate semver
+        id: version
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Invalid semver: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # 2. Bump versions in Cargo.toml files, commit, tag, push
+  # ---------------------------------------------------------------------------
+  version-bump:
+    name: Bump Version & Tag
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Install cargo-edit
+        run: cargo install cargo-edit
+
+      - name: Bump versions
+        run: |
+          # Bump each crate version
+          cd guard && cargo set-version "$VERSION" && cd ..
+          cd guard-lambda && cargo set-version "$VERSION" && cd ..
+          cd guard-ffi && cargo set-version "$VERSION" && cd ..
+
+          # Update cross-crate dependency references
+          sed -i "s/cfn-guard = { version = \"[^\"]*\"/cfn-guard = { version = \"$VERSION\"/" guard-lambda/Cargo.toml
+          sed -i "s/cfn-guard = { version = \"[^\"]*\"/cfn-guard = { version = \"$VERSION\"/" guard-ffi/Cargo.toml
+
+          # Regenerate lockfile
+          cargo generate-lockfile
+
+      - name: Commit & tag
+        run: |
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: bump version to $VERSION"
+            git push origin HEAD
+          fi
+          git tag "$VERSION"
+          git push origin "$VERSION"
+
+  # ---------------------------------------------------------------------------
+  # 3. Build cross-platform binaries
+  # ---------------------------------------------------------------------------
   build:
+    name: Build (${{ matrix.target }})
+    needs: [validate, version-bump]
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            asset_name: cfn-guard-v3-x86_64-ubuntu-latest
+            extra_asset_names: "cfn-guard-v3-ubuntu-latest cfn-guard-v3-x86_64-linux-latest cfn-guard-v3-linux-latest"
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            asset_name: cfn-guard-v3-aarch64-ubuntu-latest
+            extra_asset_names: "cfn-guard-v3-aarch64-linux-latest"
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            asset_name: cfn-guard-v3-x86_64-macos-latest
+            extra_asset_names: "cfn-guard-v3-macos-latest"
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            asset_name: cfn-guard-v3-aarch64-macos-latest
+            extra_asset_names: ""
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            asset_name: cfn-guard-v3-x86_64-windows-latest
+            extra_asset_names: "cfn-guard-v3-windows-latest"
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            asset_name: cfn-guard-v3-aarch64-windows-latest
+            extra_asset_names: ""
+          - target: i686-pc-windows-msvc
+            os: windows-latest
+            asset_name: cfn-guard-v3-i686-windows-latest
+            extra_asset_names: ""
     runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.version }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install cross-compilation deps (aarch64 linux)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
       - name: Build
-        run: cargo build --verbose --release
-      - name: Get release
-        id: get_release
-        uses: bruceadams/get-release@v1.3.2
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-      - name: Package release
-        id: package
-        uses: knicknic/os-specific-run@v1.0.3
-        with:
-          macos: |
-            rustup target add x86_64-apple-darwin
-            cargo build --release --target x86_64-apple-darwin
-            mkdir cfn-guard-v3-x86_64-${{ matrix.os }}
-            cp ./target/x86_64-apple-darwin/release/cfn-guard ./cfn-guard-v3-x86_64-${{ matrix.os }}/
-            cp README.md ./cfn-guard-v3-x86_64-${{ matrix.os }}/
-            tar czvf ./cfn-guard-v3-x86_64-${{ matrix.os }}.tar.gz ./cfn-guard-v3-x86_64-${{ matrix.os }}
-            mkdir cfn-guard-v3-${{ matrix.os }}
-            cp ./target/x86_64-apple-darwin/release/cfn-guard ./cfn-guard-v3-${{ matrix.os }}/
-            cp README.md ./cfn-guard-v3-${{ matrix.os }}/
-            tar czvf ./cfn-guard-v3-${{ matrix.os }}.tar.gz ./cfn-guard-v3-${{ matrix.os }}
+        run: cargo build --release --target ${{ matrix.target }}
 
-            rustup target add aarch64-apple-darwin
-            cargo build --release --target aarch64-apple-darwin
-            mkdir cfn-guard-v3-aarch64-${{ matrix.os }}
-            cp ./target/aarch64-apple-darwin/release/cfn-guard ./cfn-guard-v3-aarch64-${{ matrix.os }}/
-            cp README.md ./cfn-guard-v3-aarch64-${{ matrix.os }}/
-            tar czvf ./cfn-guard-v3-aarch64-${{ matrix.os }}.tar.gz ./cfn-guard-v3-aarch64-${{ matrix.os }}
-          linux: |
-            rustup target add x86_64-unknown-linux-musl
-            cargo build --release --target x86_64-unknown-linux-musl
-            mkdir cfn-guard-v3-x86_64-${{ matrix.os }}
-            cp ./target/x86_64-unknown-linux-musl/release/cfn-guard ./cfn-guard-v3-x86_64-${{ matrix.os }}/
-            cp README.md ./cfn-guard-v3-x86_64-${{ matrix.os }}/
-            tar czvf ./cfn-guard-v3-x86_64-${{ matrix.os }}.tar.gz ./cfn-guard-v3-x86_64-${{ matrix.os }}
-            mkdir cfn-guard-v3-${{ matrix.os }}
-            cp ./target/x86_64-unknown-linux-musl/release/cfn-guard ./cfn-guard-v3-${{ matrix.os }}/
-            cp README.md ./cfn-guard-v3-${{ matrix.os }}/
-            tar czvf ./cfn-guard-v3-${{ matrix.os }}.tar.gz ./cfn-guard-v3-${{ matrix.os }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          BIN="target/${{ matrix.target }}/release/cfn-guard"
+          for NAME in ${{ matrix.asset_name }} ${{ matrix.extra_asset_names }}; do
+            mkdir "$NAME"
+            cp "$BIN" README.md "$NAME/"
+            tar czvf "${NAME}.tar.gz" "$NAME"
+          done
 
-            sudo apt update
-            sudo apt install gcc-aarch64-linux-gnu
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
-            rustup target add aarch64-unknown-linux-musl
-            cargo build --release --target aarch64-unknown-linux-musl
-            mkdir cfn-guard-v3-aarch64-${{ matrix.os }}
-            cp ./target/aarch64-unknown-linux-musl/release/cfn-guard ./cfn-guard-v3-aarch64-${{ matrix.os }}/
-            cp README.md ./cfn-guard-v3-aarch64-${{ matrix.os }}/
-            tar czvf ./cfn-guard-v3-aarch64-${{ matrix.os }}.tar.gz ./cfn-guard-v3-aarch64-${{ matrix.os }}
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/cfn-guard.exe"
+          for NAME in ${{ matrix.asset_name }} ${{ matrix.extra_asset_names }}; do
+            mkdir "$NAME"
+            cp "$BIN" README.md "$NAME/"
+            tar czvf "${NAME}.tar.gz" "$NAME"
+          done
 
-            # Create linux-named packages for compatibility with tools expecting standard OS naming
-            mkdir cfn-guard-v3-x86_64-linux-latest
-            cp ./target/x86_64-unknown-linux-musl/release/cfn-guard ./cfn-guard-v3-x86_64-linux-latest/
-            cp README.md ./cfn-guard-v3-x86_64-linux-latest/
-            tar czvf ./cfn-guard-v3-x86_64-linux-latest.tar.gz ./cfn-guard-v3-x86_64-linux-latest
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: "*.tar.gz"
+          retention-days: 1
 
-            mkdir cfn-guard-v3-aarch64-linux-latest
-            cp ./target/aarch64-unknown-linux-musl/release/cfn-guard ./cfn-guard-v3-aarch64-linux-latest/
-            cp README.md ./cfn-guard-v3-aarch64-linux-latest/
-            tar czvf ./cfn-guard-v3-aarch64-linux-latest.tar.gz ./cfn-guard-v3-aarch64-linux-latest
+  # ---------------------------------------------------------------------------
+  # 4. Create GitHub Release & upload all assets
+  # ---------------------------------------------------------------------------
+  github-release:
+    name: GitHub Release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.version }}
 
-            mkdir cfn-guard-v3-linux-latest
-            cp ./target/x86_64-unknown-linux-musl/release/cfn-guard ./cfn-guard-v3-linux-latest/
-            cp README.md ./cfn-guard-v3-linux-latest/
-            tar czvf ./cfn-guard-v3-linux-latest.tar.gz ./cfn-guard-v3-linux-latest
-          windows: |
-            rustup target add x86_64-pc-windows-msvc
-            cargo build --release --target x86_64-pc-windows-msvc
-            mkdir cfn-guard-v3-x86_64-${{ matrix.os }}
-            cp ./target/x86_64-pc-windows-msvc/release/cfn-guard.exe ./cfn-guard-v3-x86_64-${{ matrix.os }}/
-            cp README.md ./cfn-guard-v3-x86_64-${{ matrix.os }}/
-            tar czvf ./cfn-guard-v3-x86_64-${{ matrix.os }}.tar.gz ./cfn-guard-v3-x86_64-${{ matrix.os }}
-            mkdir cfn-guard-v3-${{ matrix.os }}
-            cp ./target/x86_64-pc-windows-msvc/release/cfn-guard.exe ./cfn-guard-v3-${{ matrix.os }}/
-            cp README.md ./cfn-guard-v3-${{ matrix.os }}/
-            tar czvf ./cfn-guard-v3-${{ matrix.os }}.tar.gz ./cfn-guard-v3-${{ matrix.os }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
 
-            rustup target add i686-pc-windows-msvc
-            cargo build --release --target i686-pc-windows-msvc
-            mkdir cfn-guard-v3-i686-${{ matrix.os }}
-            cp ./target/i686-pc-windows-msvc/release/cfn-guard.exe ./cfn-guard-v3-i686-${{ matrix.os }}/
-            cp README.md ./cfn-guard-v3-i686-${{ matrix.os }}/
-            tar czvf ./cfn-guard-v3-i686-${{ matrix.os }}.tar.gz ./cfn-guard-v3-i686-${{ matrix.os }}
+      - name: List assets
+        run: ls -lhR artifacts/
 
-            rustup target add aarch64-pc-windows-msvc
-            cargo build --release --target aarch64-pc-windows-msvc
-            mkdir cfn-guard-v3-aarch64-${{ matrix.os }}
-            cp ./target/i686-pc-windows-msvc/release/cfn-guard.exe ./cfn-guard-v3-aarch64-${{ matrix.os }}/
-            cp README.md ./cfn-guard-v3-aarch64-${{ matrix.os }}/
-            tar czvf ./cfn-guard-v3-aarch64-${{ matrix.os }}.tar.gz ./cfn-guard-v3-aarch64-${{ matrix.os }}
-      - name: Upload x86 Release Asset
-        id: upload-x86_64-release-asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create release
+        if: ${{ !inputs.dry_run }}
+        uses: softprops/action-gh-release@v2
         with:
-          upload_url: ${{ steps.get_release.outputs.upload_url }}
-          asset_path: ./cfn-guard-v3-x86_64-${{ matrix.os }}.tar.gz
-          asset_name: cfn-guard-v3-x86_64-${{ matrix.os }}.tar.gz
-          asset_content_type: application/octet-stream
-      - name: Upload arm64 Release Asset
-        id: upload-aarch64-release-asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ env.VERSION }}
+          name: v${{ env.VERSION }}
+          generate_release_notes: true
+          files: artifacts/*.tar.gz
+
+  # ---------------------------------------------------------------------------
+  # 5. Publish to crates.io
+  # ---------------------------------------------------------------------------
+  publish-crates:
+    name: Publish to crates.io
+    needs: [validate, version-bump, github-release]
+    if: ${{ !inputs.dry_run && !inputs.skip_crates }}
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
         with:
-          upload_url: ${{ steps.get_release.outputs.upload_url }}
-          asset_path: ./cfn-guard-v3-aarch64-${{ matrix.os }}.tar.gz
-          asset_name: cfn-guard-v3-aarch64-${{ matrix.os }}.tar.gz
-          asset_content_type: application/octet-stream
-      - name: Upload i686 Release Asset
-        id: upload-i686-release-asset
-        if: matrix.os == 'windows-latest'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ needs.validate.outputs.version }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Publish cfn-guard
+        run: |
+          cd guard
+          cargo publish --dry-run
+          cargo publish
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish cfn-guard-lambda
+        run: |
+          cd guard-lambda
+          cargo publish --dry-run
+          cargo publish
+
+      - name: Publish cfn-guard-ffi
+        run: |
+          cd guard-ffi
+          cargo publish --dry-run
+          cargo publish
+
+  # ---------------------------------------------------------------------------
+  # 6. Publish Docker to ECR Public
+  # ---------------------------------------------------------------------------
+  publish-docker:
+    name: Publish Docker to ECR
+    needs: [validate, version-bump]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
         with:
-          upload_url: ${{ steps.get_release.outputs.upload_url }}
-          asset_path: ./cfn-guard-v3-i686-${{ matrix.os }}.tar.gz
-          asset_name: cfn-guard-v3-i686-${{ matrix.os }}.tar.gz
-          asset_content_type: application/octet-stream
-      - name: Upload Release Asset (Legacy)
-        id: upload-release-asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ needs.validate.outputs.version }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          upload_url: ${{ steps.get_release.outputs.upload_url }}
-          asset_path: ./cfn-guard-v3-${{ matrix.os }}.tar.gz
-          asset_name: cfn-guard-v3-${{ matrix.os }}.tar.gz
-          asset_content_type: application/octet-stream
-      # Upload linux-named assets for compatibility with tools expecting standard OS naming
-      - name: Upload x86 Linux Release Asset
-        id: upload-x86_64-linux-release-asset
-        if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: ${{ secrets.PUBLISHER_ROLE_NAME }}
+          role-session-name: PublishToECR
+
+      - name: Login to ECR Public
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
         with:
-          upload_url: ${{ steps.get_release.outputs.upload_url }}
-          asset_path: ./cfn-guard-v3-x86_64-linux-latest.tar.gz
-          asset_name: cfn-guard-v3-x86_64-linux-latest.tar.gz
-          asset_content_type: application/octet-stream
-      - name: Upload arm64 Linux Release Asset
-        id: upload-aarch64-linux-release-asset
-        if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-release-asset@v1
+          registry-type: public
+
+      - name: Build & push
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.get_release.outputs.upload_url }}
-          asset_path: ./cfn-guard-v3-aarch64-linux-latest.tar.gz
-          asset_name: cfn-guard-v3-aarch64-linux-latest.tar.gz
-          asset_content_type: application/octet-stream
-      - name: Upload Linux Release Asset (Legacy)
-        id: upload-linux-release-asset
-        if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.get_release.outputs.upload_url }}
-          asset_path: ./cfn-guard-v3-linux-latest.tar.gz
-          asset_name: cfn-guard-v3-linux-latest.tar.gz
-          asset_content_type: application/octet-stream
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REGISTRY_ALIAS: ${{ secrets.REGISTRY_ALIAS }}
+          REPOSITORY: cloudformation-guard
+        run: |
+          PREFIX="$REGISTRY/$REGISTRY_ALIAS/$REPOSITORY"
+          docker build \
+            -t "$PREFIX:$VERSION" \
+            -t "$PREFIX:latest" \
+            .
+          docker push "$PREFIX:$VERSION"
+          docker push "$PREFIX:latest"
+
+  # ---------------------------------------------------------------------------
+  # 7. Open Homebrew PR
+  # ---------------------------------------------------------------------------
+  publish-homebrew:
+    name: Homebrew PR
+    needs: [validate, github-release]
+    if: ${{ !inputs.dry_run && !inputs.skip_homebrew }}
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+      HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+    steps:
+      - name: Update Homebrew & open PR
+        run: |
+          brew update
+          TARBALL_URL="https://github.com/aws-cloudformation/cloudformation-guard/archive/refs/tags/${VERSION}.tar.gz"
+          curl -fsSL "$TARBALL_URL" -o guard.tar.gz
+          SHA256=$(shasum -a 256 guard.tar.gz | awk '{print $1}')
+          brew bump-formula-pr \
+            --url "$TARBALL_URL" \
+            --sha256 "$SHA256" \
+            --no-browse \
+            cloudformation-guard
