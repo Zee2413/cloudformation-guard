@@ -81,15 +81,12 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Install cargo-edit
-        run: cargo install cargo-edit
-
       - name: Bump versions
         run: |
           # Bump each crate version
-          cd guard && cargo set-version "$VERSION" && cd ..
-          cd guard-lambda && cargo set-version "$VERSION" && cd ..
-          cd guard-ffi && cargo set-version "$VERSION" && cd ..
+          sed -i 's/^version = "[^"]*"/version = "'"$VERSION"'"/' guard/Cargo.toml
+          sed -i 's/^version = "[^"]*"/version = "'"$VERSION"'"/' guard-lambda/Cargo.toml
+          sed -i 's/^version = "[^"]*"/version = "'"$VERSION"'"/' guard-ffi/Cargo.toml
 
           # Update cross-crate dependency references
           sed -i "s/cfn-guard = { version = \"[^\"]*\"/cfn-guard = { version = \"$VERSION\"/" guard-lambda/Cargo.toml
