@@ -69,6 +69,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     env:
       VERSION: ${{ needs.validate.outputs.version }}
     steps:
@@ -102,10 +103,11 @@ jobs:
 
       - name: Commit & tag
         run: |
+          BRANCH="release/$VERSION"
+          git checkout -b "$BRANCH"
           git add -A
           if ! git diff --cached --quiet; then
             git commit -m "chore: bump version to $VERSION"
-            git push origin HEAD
           fi
           if git rev-parse "$VERSION" >/dev/null 2>&1; then
             echo "Tag $VERSION already exists, skipping"
@@ -113,6 +115,18 @@ jobs:
             git tag "$VERSION"
             git push origin "$VERSION"
           fi
+          git push origin "$BRANCH"
+
+      - name: Create PR to merge version bump back to main
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base main \
+            --head "release/$VERSION" \
+            --title "chore: bump version to $VERSION" \
+            --body "Automated version bump from release workflow. Merge after release is complete."
 
   # ---------------------------------------------------------------------------
   # 3. Build cross-platform binaries
